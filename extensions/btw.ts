@@ -45,7 +45,9 @@ const BTW_RESET_TYPE = "btw-thread-reset";
 const BTW_MODEL_OVERRIDE_TYPE = "btw-model-override";
 const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
 const BTW_DEFAULT_FOCUS_SHORTCUTS: readonly KeyId[] = [Key.alt("/"), Key.super("/"), Key.ctrlAlt("w")];
+const BTW_DEFAULT_WIDTH_SHORTCUT: KeyId = Key.alt("w");
 const BTW_FOCUS_KEYS_ENV = "PI_BTW_FOCUS_KEYS";
+const BTW_WIDTH_KEY_ENV = "PI_BTW_WIDTH_KEY";
 const BTW_FOCUS_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
 // Mirrors the SpecialKey union in @earendil-works/pi-tui keys.d.ts (lower-cased).
 const BTW_FOCUS_SPECIAL_KEYS = new Set([
@@ -145,15 +147,19 @@ export function describeFocusShortcuts(shortcuts: readonly KeyId[]): string {
   return `${labels.slice(0, -1).join(", ")} or ${labels[labels.length - 1]}`;
 }
 
+export function resolveBtwWidthShortcut(env: NodeJS.ProcessEnv = process.env): KeyId {
+  const candidate = env[BTW_WIDTH_KEY_ENV]?.trim().toLowerCase();
+  return candidate && isValidFocusShortcut(candidate) ? (candidate as KeyId) : BTW_DEFAULT_WIDTH_SHORTCUT;
+}
+
 const BTW_FOCUS_SHORTCUTS: readonly KeyId[] = resolveBtwFocusShortcuts();
 const BTW_FOCUS_SHORTCUTS_LABEL = describeFocusShortcuts(BTW_FOCUS_SHORTCUTS);
+const BTW_WIDTH_TOGGLE_SHORTCUT: KeyId = resolveBtwWidthShortcut();
+const BTW_WIDTH_TOGGLE_SHORTCUT_LABEL = describeFocusShortcuts([BTW_WIDTH_TOGGLE_SHORTCUT]);
 
 function matchesBtwFocusShortcut(data: string): boolean {
   return BTW_FOCUS_SHORTCUTS.some((shortcut) => matchesKey(data, shortcut));
 }
-
-/** Toggles the overlay between framed "window" width and edge-to-edge "full" width. */
-const BTW_WIDTH_TOGGLE_SHORTCUT: KeyId = Key.alt("w");
 
 function matchesBtwWidthToggle(data: string): boolean {
   return matchesKey(data, BTW_WIDTH_TOGGLE_SHORTCUT);
@@ -176,7 +182,7 @@ const BTW_CONTINUE_THREAD_USER_TEXT = "[The following is a separate side convers
 const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conversation.";
 
 type SessionThinkingLevel = "off" | AiThinkingLevel;
-type BtwThreadMode = "contextual" | "tangent" | "readonly";
+export type BtwThreadMode = "contextual" | "tangent" | "readonly";
 type SessionModel = NonNullable<ExtensionCommandContext["model"]>;
 /**
  * Loose model reference parsed from `/btw:model <provider> <id> <api>` and persisted to
@@ -266,6 +272,7 @@ type BtwTranscriptState = {
 type BtwSessionRuntime = {
   session: AgentSession;
   mode: BtwThreadMode;
+  toolNames: string[];
   subscriptions: Set<() => void>;
   sideThreadStartIndex: number;
   abortPromise?: Promise<void>;
@@ -444,15 +451,24 @@ function formatModelRef(model: Pick<SessionModel, "provider" | "id" | "api">): s
 }
 
 /**
- * Tool surfaces keyed by BTW mode. Read-only mode exposes only pi's built-in
- * read-only tools so the child session cannot mutate the workspace; every other
- * mode matches pi's default coding-agent toolset (read/bash/edit/write).
+ * Maximum tool surfaces keyed by BTW mode. The actual child tool set is always
+ * intersected with the parent's currently active tools, so BTW cannot widen a
+ * parent plan/read-only/custom allowlist. Child extensions remain unloaded.
  */
 const BTW_TOOLS_BY_MODE: Record<BtwThreadMode, readonly string[]> = {
   contextual: ["read", "bash", "edit", "write"],
   tangent: ["read", "bash", "edit", "write"],
   readonly: ["read", "grep", "find", "ls"],
 };
+
+export function resolveBtwToolNames(mode: BtwThreadMode, parentActiveTools: readonly string[]): string[] {
+  const active = new Set(parentActiveTools);
+  return BTW_TOOLS_BY_MODE[mode].filter((name) => active.has(name));
+}
+
+function sameToolNames(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((name, index) => name === right[index]);
+}
 
 function buildBtwSeedState(
   ctx: ExtensionCommandContext,
@@ -955,7 +971,7 @@ function appendPersistedTranscriptTurn(state: BtwTranscriptState, details: BtwDe
 
 function setTranscriptFailure(state: BtwTranscriptState, message: string): void {
   const turnId = state.currentTurnId ?? state.lastTurnId ?? ensureTranscriptTurn(state);
-  upsertTranscriptTextEntry(state, turnId, "assistant-text", `❌ ${message}`, false);
+  upsertTranscriptTextEntry(state, turnId, "assistant-text", `Error: ${message}`, false);
   finishTranscriptTurn(state, turnId, "failed");
 }
 
@@ -1608,7 +1624,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = `Scroll wheel ↑↓ PgUp/PgDn · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width · Esc`;
+    this.hintsTextValue = `Scroll wheel ↑↓ PgUp/PgDn · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · ${BTW_WIDTH_TOGGLE_SHORTCUT_LABEL} width · Esc`;
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1713,8 +1729,8 @@ export default function (pi: ExtensionAPI) {
     }
     setOverlayStatus(
       overlayWidthMode === "full"
-        ? "Full-width mode. Shift+drag now selects only the dialog. Alt+w to restore the window."
-        : "Window mode. Alt+w switches to full-width for clean copy selection.",
+        ? `Full-width mode. Shift+drag now selects only the dialog. ${BTW_WIDTH_TOGGLE_SHORTCUT_LABEL} to restore the window.`
+        : `Window mode. ${BTW_WIDTH_TOGGLE_SHORTCUT_LABEL} switches to full-width for clean copy selection.`,
       ctx,
     );
   }
@@ -1749,17 +1765,17 @@ export default function (pi: ExtensionAPI) {
     applyTranscriptEvent(transcriptState, event);
 
     if (event.type === "tool_execution_start") {
-      setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
+      setOverlayStatus(`running tool: ${event.toolName}`, ctx);
       return;
     }
 
     if (event.type === "tool_execution_end") {
-      setOverlayStatus(sessionRuntime.session.isStreaming ? `⏳ running tool: ${event.toolName}` : "⏳ streaming...", ctx);
+      setOverlayStatus(sessionRuntime.session.isStreaming ? `running tool: ${event.toolName}` : "streaming...", ctx);
       return;
     }
 
     if (event.type === "turn_end") {
-      setOverlayStatus("⏳ streaming...", ctx);
+      setOverlayStatus("streaming...", ctx);
       return;
     }
 
@@ -1794,6 +1810,14 @@ export default function (pi: ExtensionAPI) {
     return sessionRuntime.abortPromise;
   }
 
+  async function settleBtwSessionRuntime(sessionRuntime: BtwSessionRuntime): Promise<void> {
+    if (sessionRuntime.session.isStreaming || sessionRuntime.abortPromise) {
+      void requestBtwSessionAbort(sessionRuntime);
+    }
+    await sessionRuntime.promptQueue;
+    await sessionRuntime.abortPromise;
+  }
+
   async function disposeBtwSession(): Promise<void> {
     const current = activeBtwSession;
     activeBtwSession = null;
@@ -1824,10 +1848,10 @@ export default function (pi: ExtensionAPI) {
   async function dismissOrAbortOverlaySession(): Promise<void> {
     const sessionRuntime = activeBtwSession;
     if (sessionRuntime?.session.isStreaming && !sessionRuntime.abortPromise) {
-      setOverlayStatus("⏹ Aborting. Press Esc again to dismiss the BTW overlay.");
+      setOverlayStatus("Aborting. Press Esc again to dismiss the BTW overlay.");
       await requestBtwSessionAbort(sessionRuntime);
       if (activeBtwSession === sessionRuntime && overlayRuntime) {
-        setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.");
+        setOverlayStatus("Aborted. Press Esc again to dismiss the BTW overlay.");
       }
       return;
     }
@@ -1969,6 +1993,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionCommandContext,
     mode: BtwThreadMode,
     settings: ResolvedBtwSettings,
+    toolNames: string[],
   ): Promise<BtwSessionRuntime> {
     if (!settings.model) {
       throw new Error(settings.fallbackReason || "No active model selected.");
@@ -1989,13 +2014,12 @@ export default function (pi: ExtensionAPI) {
       model: settings.model,
       ...modelRuntimeOptions,
       thinkingLevel: settings.thinkingLevel,
-      // Read-only mode narrows this to pi's built-in read-only toolset.
-      tools: [...BTW_TOOLS_BY_MODE[mode]],
+      tools: toolNames,
       resourceLoader: createBtwResourceLoader(ctx),
     };
     const { session } = await createAgentSession(sessionOptions);
 
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve() };
+    return { session, mode, toolNames, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve() };
   }
 
   async function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
@@ -2004,12 +2028,16 @@ export default function (pi: ExtensionAPI) {
       return null;
     }
 
-    if (activeBtwSession?.mode === mode) {
+    const toolNames = resolveBtwToolNames(mode, pi.getActiveTools());
+    if (activeBtwSession?.mode === mode && sameToolNames(activeBtwSession.toolNames, toolNames)) {
       return activeBtwSession;
     }
 
+    if (activeBtwSession) {
+      await settleBtwSessionRuntime(activeBtwSession);
+    }
     await disposeBtwSession();
-    activeBtwSession = await createBtwSubSession(ctx, mode, settings);
+    activeBtwSession = await createBtwSubSession(ctx, mode, settings, toolNames);
     return activeBtwSession;
   }
 
@@ -2131,7 +2159,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (pendingMode !== "contextual") {
-        await resetThread(ctx, true, "contextual");
+        await resetThread(ctx, true, "contextual", true);
       }
 
       await runBtw(ctx, question, save, "contextual");
@@ -2145,7 +2173,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
       if (pendingMode !== "tangent") {
-        await resetThread(ctx, true, "tangent");
+        await resetThread(ctx, true, "tangent", true);
       }
 
       if (!question) {
@@ -2168,7 +2196,7 @@ export default function (pi: ExtensionAPI) {
       // Read-only mode is a distinct capability boundary, so switching into it
       // resets the thread and lets ensureBtwSession recreate the child session.
       if (pendingMode !== "readonly") {
-        await resetThread(ctx, true, "readonly");
+        await resetThread(ctx, true, "readonly", true);
       }
 
       if (!question) {
@@ -2188,7 +2216,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      await resetThread(ctx, true, "contextual");
+      await resetThread(ctx, true, "contextual", pendingMode !== "contextual");
       if (question) {
         await runBtw(ctx, question, save, "contextual");
       } else {
@@ -2260,7 +2288,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      setOverlayStatus("⏳ injecting into the main session...", ctx);
+      setOverlayStatus("injecting into the main session...", ctx);
       await ensureOverlay(ctx);
 
       try {
@@ -2289,7 +2317,7 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      setOverlayStatus("⏳ summarizing...", ctx);
+      setOverlayStatus("summarizing...", ctx);
       await ensureOverlay(ctx);
 
       try {
@@ -2349,7 +2377,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     setOverlayDraft("");
-    setOverlayStatus("⏳ streaming...", ctx);
+    setOverlayStatus("streaming...", ctx);
     syncUi(ctx);
     await runBtw(cmdCtx, question, false, pendingMode);
   }
@@ -2358,8 +2386,16 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext | ExtensionCommandContext,
     persist = true,
     mode: BtwThreadMode = "contextual",
+    settleInFlight = false,
   ): Promise<void> {
     invalidateBtwLifecycle();
+    if (settleInFlight) {
+      const current = activeBtwSession;
+      const pendingSubmissions = btwSubmissionQueue;
+      const settlement = current ? settleBtwSessionRuntime(current) : Promise.resolve();
+      await pendingSubmissions;
+      await settlement;
+    }
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = mode;
@@ -2520,7 +2556,7 @@ export default function (pi: ExtensionAPI) {
     sessionRuntime.promptQueue = previousPromptTurns.then(() => currentPromptTurn);
 
     if (session.isStreaming || sessionRuntime.abortPromise) {
-      setOverlayStatus("⏳ waiting for the current BTW turn to finish...", ctx);
+      setOverlayStatus("waiting for the current BTW turn to finish...", ctx);
     }
     await previousPromptTurns;
     if (activeBtwSession !== sessionRuntime) {
@@ -2529,7 +2565,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (sessionRuntime.abortPromise) {
-      setOverlayStatus("⏳ waiting for cancellation to finish...", ctx);
+      setOverlayStatus("waiting for cancellation to finish...", ctx);
       await sessionRuntime.abortPromise;
       if (activeBtwSession !== sessionRuntime) {
         releasePromptTurn();
@@ -2543,7 +2579,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     sessionRuntime.abortPromise = undefined;
-    setOverlayStatus("⏳ streaming...", ctx);
+    setOverlayStatus("streaming...", ctx);
     await ensureOverlay(ctx);
 
     try {
@@ -2559,7 +2595,7 @@ export default function (pi: ExtensionAPI) {
       if (response.stopReason === "aborted") {
         const abortedTurnId = transcriptState.currentTurnId ?? transcriptState.lastTurnId;
         finishTranscriptTurn(transcriptState, abortedTurnId, "aborted");
-        setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.", ctx);
+        setOverlayStatus("Aborted. Press Esc again to dismiss the BTW overlay.", ctx);
         return;
       }
       if (response.stopReason === "error") {

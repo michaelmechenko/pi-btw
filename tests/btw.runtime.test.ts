@@ -8,6 +8,8 @@ import btwExtension, {
   describeFocusShortcuts,
   isValidFocusShortcut,
   resolveBtwFocusShortcuts,
+  resolveBtwToolNames,
+  resolveBtwWidthShortcut,
 } from "../extensions/btw";
 
 const {
@@ -532,6 +534,7 @@ function createHarness(
     keybindingMatches?: (data: string, id: string) => boolean;
     tuiMode?: "regular" | "fullscreen";
     contextMode?: "tui" | "rpc" | "json" | "print";
+    activeTools?: string[];
   } = {},
 ) {
   const commands = new Map<string, RegisteredCommand>();
@@ -569,6 +572,7 @@ function createHarness(
 
   const model = { provider: "test-provider", id: "test-model", api: "openai-responses" };
   let idle = true;
+  let activeTools = options.activeTools ?? ["read", "bash", "edit", "write", "grep", "find", "ls"];
   let hasCredentials = true;
   let mainThinkingLevel: string = "off";
   let credentialSource: string | undefined;
@@ -661,7 +665,7 @@ function createHarness(
     getSessionName: vi.fn() as any,
     setLabel: vi.fn() as any,
     exec: vi.fn() as any,
-    getActiveTools: vi.fn(() => []) as any,
+    getActiveTools: vi.fn(() => [...activeTools]) as any,
     getAllTools: vi.fn(() => []) as any,
     setActiveTools: vi.fn() as any,
     getCommands: vi.fn(() => Array.from(commands.values())) as any,
@@ -811,6 +815,9 @@ function createHarness(
     setIdle(value: boolean) {
       idle = value;
     },
+    setActiveTools(value: string[]) {
+      activeTools = [...value];
+    },
     setCredentials(value: boolean) {
       hasCredentials = value;
     },
@@ -887,6 +894,7 @@ describe("btw runtime behavior", () => {
     );
     expect(options.resourceLoader.getSystemPromptSource()).toBeUndefined();
     expect(options.resourceLoader.getAppendSystemPromptSources()).toEqual([]);
+    expect(options.resourceLoader.getExtensions()).toMatchObject({ extensions: [], errors: [] });
 
     const subSession = subSessionRecords[0]?.session;
     expect(subSession).toBeDefined();
@@ -1295,6 +1303,61 @@ describe("btw runtime behavior", () => {
     ).not.toContain("main session task");
   });
 
+  it("intersects contextual and read-only child tools with the parent's active tools", async () => {
+    const harness = createHarness([], { activeTools: ["read", "bash", "grep", "lsp_navigation"] });
+
+    await harness.runSessionStart();
+    await harness.command("btw", "contextual question");
+    expect(subSessionRecords[0].options.tools).toEqual(["read", "bash"]);
+
+    await harness.command("btw:ask", "read-only question");
+    expect(subSessionRecords[1].options.tools).toEqual(["read", "grep"]);
+    expect(resolveBtwToolNames("readonly", ["bash", "write"])).toEqual([]);
+  });
+
+  it("recreates a contextual child when the parent's active-tool boundary narrows", async () => {
+    const harness = createHarness();
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    const firstSession = subSessionRecords[0].session;
+
+    harness.setActiveTools(["read", "bash"]);
+    await harness.command("btw", "second question");
+
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(firstSession.abort).toHaveBeenCalledTimes(1);
+    expect(firstSession.dispose).toHaveBeenCalledTimes(1);
+    expect(subSessionRecords[1].options.tools).toEqual(["read", "bash"]);
+  });
+
+  it("settles an in-flight turn before switching to a different access mode", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock
+      .mockImplementationOnce(() => blocking.stream())
+      .mockImplementationOnce(() => streamAnswer("read-only answer"));
+
+    await harness.runSessionStart();
+    const contextual = harness.command("btw", "contextual question");
+    await flushAsyncWork();
+    const firstSession = subSessionRecords[0].session;
+    expect(subSessionRecords[0].getIsStreaming()).toBe(true);
+
+    const transition = harness.command("btw:ask", "read-only question");
+    await flushAsyncWork();
+    expect(firstSession.abort).toHaveBeenCalledTimes(1);
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+
+    blocking.release();
+    await contextual;
+    await transition;
+
+    expect(firstSession.dispose).toHaveBeenCalledTimes(1);
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(subSessionRecords[1].options.tools).toEqual(["read", "grep", "find", "ls"]);
+  });
+
   it("/btw:ask creates a read-only sub-session with only pi's read-only tools", async () => {
     const harness = createHarness();
 
@@ -1490,7 +1553,7 @@ describe("btw runtime behavior", () => {
 
     const overlay = harness.latestOverlayComponent();
     expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
-    expect(transcriptText(overlay)).toContain("❌ Sub-session prompt exploded");
+    expect(transcriptText(overlay)).toContain("Error: Sub-session prompt exploded");
     expect(harness.notifications.at(-1)).toEqual({
       message: "Sub-session prompt exploded",
       type: "error",
@@ -2142,7 +2205,7 @@ describe("btw runtime behavior", () => {
       streaming: false,
     });
     expect(findLatest(entries, (entry: any) => entry.type === "assistant-text")).toMatchObject({
-      text: "❌ Sub-session prompt exploded",
+      text: "Error: Sub-session prompt exploded",
       streaming: false,
     });
     expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
@@ -2394,7 +2457,7 @@ describe("btw runtime behavior", () => {
 
     const overlay = harness.latestOverlayComponent();
     overlay.refresh();
-    expect(overlay.hintsText.text).toContain("Alt+w width");
+    expect(overlay.hintsText.text).toContain("Alt+W width");
   });
 
   it("toggles the overlay between window and full-width layouts on Alt+w, preserving the draft", async () => {
@@ -3149,7 +3212,7 @@ describe("btw runtime behavior", () => {
     expect(transcriptText(overlay)).toContain("You  first question");
     expect(transcriptText(overlay)).toContain("First answer");
     expect(transcriptText(overlay)).toContain("You  /plan fail loudly");
-    expect(transcriptText(overlay)).toContain("❌ Slash dispatch exploded");
+    expect(transcriptText(overlay)).toContain("Error: Slash dispatch exploded");
     expect(harness.notifications.at(-1)).toEqual({
       message: "Slash dispatch exploded",
       type: "error",
@@ -3280,6 +3343,12 @@ describe("configurable BTW focus shortcuts", () => {
       "super+/",
       "ctrl+alt+w",
     ]);
+  });
+
+  it("uses a configurable width shortcut and falls back on invalid input", () => {
+    expect(resolveBtwWidthShortcut({})).toBe("alt+w");
+    expect(resolveBtwWidthShortcut({ PI_BTW_WIDTH_KEY: " Alt+Shift+/ " })).toBe("alt+shift+/");
+    expect(resolveBtwWidthShortcut({ PI_BTW_WIDTH_KEY: "cmd+w" })).toBe("alt+w");
   });
 
   it("validates identifiers against the pi-tui key grammar", () => {

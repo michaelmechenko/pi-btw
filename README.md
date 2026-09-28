@@ -9,7 +9,7 @@ A small [pi](https://github.com/earendil-works/pi-mono) extension that adds a `/
 ## What it does
 
 - opens a parallel side conversation without interrupting the main run
-- runs that side conversation as a real pi sub-session with `read` / `bash` / `edit` / `write` tool access
+- runs that side conversation as a real pi sub-session whose tool set is intersected with the parent session's active tools
 - keeps a continuous BTW thread by default
 - accepts `/side` as an alias for the `/btw` entry command
 - supports `/btw:tangent` for a contextless side thread that does not inherit the current main-session conversation
@@ -90,14 +90,15 @@ pi install /absolute/path/to/pi-btw
 
 ## Overlay controls
 
-- `Alt+w` toggles the overlay between the framed window layout (inset from the terminal edges) and a full-width layout
+- `Alt+w` toggles the overlay between the framed window layout (inset from the terminal edges) and a full-width layout; set `PI_BTW_WIDTH_KEY` to remap it
 - full-width mode makes terminal Shift+drag selection capture only the dialog's own text, which is handy for copying without pulling in surrounding main-screen content
 - window mode keeps the full box frame; full-width mode drops the side borders and corner glyphs (keeping only horizontal rules) so those border columns never land inside a drag selection
 - `Alt+/`, `Super+/`, or `Ctrl+Alt+W` toggles focus between BTW and the main editor without closing the overlay
 - `Super+/` requires a terminal that reports the Super modifier, typically through the Kitty keyboard protocol
 - `Ctrl+Alt+W` remains a fallback for terminals that do not deliver either primary shortcut
 - set the `PI_BTW_FOCUS_KEYS` environment variable to remap these when they conflict with your window manager or terminal
-- the value is a comma-separated list of pi-tui key identifiers such as `PI_BTW_FOCUS_KEYS="ctrl+/,ctrl+alt+b"`; it replaces the defaults entirely
+- set `PI_BTW_WIDTH_KEY` to one pi-tui key identifier when `Alt+w` conflicts (for example, `PI_BTW_WIDTH_KEY="alt+shift+/"`)
+- the focus value is a comma-separated list of pi-tui key identifiers such as `PI_BTW_FOCUS_KEYS="ctrl+/,ctrl+alt+b"`; it replaces the defaults entirely
 - identifiers combine `ctrl`, `shift`, `alt`, and `super` with a single base key (letter, digit, symbol, or named key like `enter`/`f5`); blank or invalid entries are ignored, and the defaults are kept if none are usable
 - while BTW is streaming, the first `Esc` aborts the request and keeps its partial transcript visible; press `Esc` again to dismiss
 - while BTW is idle, `Esc` dismisses the overlay immediately
@@ -170,7 +171,10 @@ BTW is implemented as an actual pi sub-session with its own in-memory session st
 
 - contextual `/btw` threads seed that sub-session from the current main-session branch while filtering out BTW-visible notes from the parent context
 - `/btw:tangent` starts the same BTW UI in a contextless mode with no inherited main-session conversation
-- `/btw:ask` seeds the same main-session context as `/btw` but restricts the child session's tool surface to pi's read-only tools, so the boundary is structural rather than prompt-based
+- every BTW mode intersects its maximum tool surface with the parent session's currently active tools, so parent plan/read-only/custom restrictions cannot be widened; a changed parent tool boundary recreates the child session
+- `/btw:ask` seeds the same main-session context as `/btw` but further restricts the child session's maximum tool surface to pi's read-only tools, so the boundary is structural rather than prompt-based
+- BTW child sessions load no parent extensions or skills; only the explicit intersected built-in tools are available
+- access-mode transitions abort and settle any in-flight BTW turn before replacing the child session
 - BTW can inherit the main thread model/thinking settings or use BTW-only overrides via `/btw:model` and `/btw:thinking`
 - `/btw:summarize` uses the current effective BTW model but keeps thinking off
 - the overlay transcript/status line is driven from sub-session events, so tool activity, streaming deltas, failures, and recovery are all visible without scraping rendered output
